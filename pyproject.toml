@@ -13,6 +13,7 @@ nodriver = "^0.36"
 beautifulsoup4 = "^4.12.3"
 python-dotenv = "^1.0.1"
 aiosqlite = "^0.20.0"
+aiohttp = "^3.10.5"
 
 [build-system]
 requires = ["poetry-core"]

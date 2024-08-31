@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
+import email
 import json
 import os
 import random
 import time
 from asyncio import gather, sleep
+from datetime import datetime
 
+import aiohttp
 import aiosqlite
 import nodriver as uc
 from bs4 import BeautifulSoup
@@ -15,6 +18,7 @@ from telethon import TelegramClient, events
 CLIENT = None
 # timestamp of the last performed GET request
 LAST_EXECUTION_TIME = 0
+WEBHOOK = "http://localhost/"
 
 
 async def parse_message(message: str):
@@ -43,7 +47,7 @@ async def parse_message(message: str):
         print(f"{message} is not a valid JSON")
 
 
-async def get_duration(browser: uc.Browser, url: str):
+async def get_duration_and_datetime(browser: uc.Browser, url: str):
     global LAST_EXECUTION_TIME
     css_class = "playbackTimeline__duration"
 
@@ -51,6 +55,7 @@ async def get_duration(browser: uc.Browser, url: str):
     retry = True
 
     duration = "0:00"
+    dt = datetime.now()
     while retry:
         # avoid getting rate limited by SoundCloud
         base_delay = 15
@@ -70,6 +75,7 @@ async def get_duration(browser: uc.Browser, url: str):
                 print(f"Looks like the track does not exist anymore: {url}")
                 break
             duration = soup.find("div", class_=css_class).find_all("span")[1].text
+            dt = datetime.fromisoformat(soup.find("time").get("datetime"))
             retry = False
         except Exception as e:
             print(f"Error: {e}, {url}")
@@ -78,19 +84,16 @@ async def get_duration(browser: uc.Browser, url: str):
             # give up at some point
             retry = attempts < 5
 
-    return duration
+    return duration, dt
 
 
-async def insert_message(
-    conn: aiosqlite.Connection, cursor: aiosqlite.Cursor, message
-):
+async def insert_message(conn: aiosqlite.Connection, cursor: aiosqlite.Cursor, message):
     payload = await parse_message(message.text)
     await cursor.execute(
         "INSERT OR IGNORE INTO queue (id, artist, title, url) VALUES (?, ?, ?, ?)",
         (message.id, payload["username"], payload["title"], payload["trackurl"]),
     )
     await conn.commit()
-    # await CLIENT.delete_messages("IFTTT", message_ids=message.id)
 
 
 async def parse_previous_messages():
@@ -109,7 +112,7 @@ async def parse_previous_messages():
 def handle_new_messages():
     print("Listening for new messages")
 
-    @CLIENT.on(events.NewMessage(from_users="IFTTT"))
+    @CLIENT.on(events.NewMessage("IFTTT"))
     async def handler(message):
         conn = await aiosqlite.connect("scs.db")
         cursor = await conn.cursor()
@@ -136,14 +139,23 @@ async def check_durations():
             id, artist, title, url = row
             print(f"Processing ID: {id}")
             # Process the URL here
-            duration = await get_duration(browser, url)
+            duration, dt = await get_duration_and_datetime(browser, url)
             tmp = duration.split(":")
             if len(tmp) == 3 or (len(tmp) == 2 and int(tmp[0]) > 30):
-                print(
-                    f'likely a set (artist {artist}, title "{title}", duration {duration})'
-                )
+                async with aiohttp.ClientSession() as session:
+                    await session.post(
+                        WEBHOOK,
+                        json={
+                            "artist": artist,
+                            "title": title,
+                            "url": url,
+                            "date": email.utils.format_datetime(dt, usegmt=True),
+                            "duration": duration,
+                        },
+                    )
             await cursor.execute("UPDATE queue SET processed = 1 WHERE id = ?", (id,))
             await conn.commit()
+            await CLIENT.delete_messages("IFTTT", message_ids=id)
         else:
             await sleep(1)
 
@@ -169,6 +181,7 @@ async def initialize_database():
     """
     )
     await conn.commit()
+
     await cursor.close()
     await conn.close()
 
@@ -187,9 +200,10 @@ if __name__ == "__main__":
     try:
         api_id = int(os.getenv("API_ID"))
         api_hash = os.getenv("API_HASH")
+        WEBHOOK = os.getenv("WEBHOOK")
     except KeyError:
         print(
-            "Please provide API_ID and API_HASH in .env file or as environment variables"
+            "Please provide API_ID, API_HASH, and WEBHOOK in .env file or as environment variables"
         )
         exit(1)
     except ValueError:
