@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
 import json
+import os
 from asyncio import sleep
 
 import nodriver as uc
 from bs4 import BeautifulSoup
-from dotenv import dotenv_values
+from dotenv import load_dotenv
 from telethon import TelegramClient
 
 CLIENT = None
@@ -15,6 +16,17 @@ css_class = "playbackTimeline__duration"
 
 
 async def parse_message(message: str):
+    """
+    Function to parse a message and return a JSON object.
+    Message format:
+    {
+        "username": "Amelie Lens",
+        "title": "Amelie Lens Presents EXHALE Radio 099 w/ Clara Cuvé",
+        "trackurl": "https://soundcloud.com/amelielens/amelie-lens-presents-exhale-radio-099-w-clara-cuve"
+    }
+
+    Note: The title field may contain double quotes, which need to be escaped.
+    """
     text = message.split("\n")
     prefix_end_index = text[2].find(prefix) + len(prefix)
     title = text[2][prefix_end_index:-2]
@@ -50,16 +62,17 @@ async def main():
 
 
 if __name__ == "__main__":
-    config = dotenv_values(".env")
+    load_dotenv(".env")
     try:
-        api_id = int(config["API_ID"])
-        api_hash = config["API_HASH"]
+        api_id = int(os.getenv("API_ID"))
+        api_hash = os.getenv("API_HASH")
     except KeyError:
-        print("Please provide API_ID and API_HASH in .env file")
+        print("Please provide API_ID and API_HASH in .env file or as environment variables")
         exit(1)
     except ValueError:
         print("API_ID must be an integer")
         exit(1)
+
     CLIENT = TelegramClient("anon", api_id, api_hash)
     with CLIENT:
         CLIENT.loop.run_until_complete(main())
