@@ -40,7 +40,7 @@ class ScCrawler:
         self.authMethod = authMethod
 
         # https://github.com/soundcloud/api/issues/182#issuecomment-1036138170
-        self.searchLimiter = StrictLimiter(30000 / 3600)
+        self.searchLimiter = StrictLimiter(25000 / 3600)
         # https://developers.soundcloud.com/docs/api/guide#authentication
         self.clientCredentialLimiter = StrictLimiter(50 / (12 * 3600))
 
@@ -55,6 +55,7 @@ class ScCrawler:
         # TODO when and how to clean these up?
         self.conn = None
         self.cursor = None
+        self.session = None
 
     async def init(self):
         try:
@@ -88,6 +89,13 @@ class ScCrawler:
         """
         )
         await self.conn.commit()
+
+        # Create a single aiohttp session
+        self.session = aiohttp.ClientSession()
+
+    async def close(self):
+        await self.session.close()
+        await self.conn.close()
 
     def setTokens(self, response):
         self.accessToken = response["access_token"]
@@ -139,18 +147,17 @@ class ScCrawler:
             await self.searchLimiter.wait()
 
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        url,
-                        headers=headers,
-                        params=params,
-                    ) as resp:
-                        if resp.status == 200:
-                            return await resp.json()
-                        elif resp.status == 429:
-                            print("Rate limited, this shoudn't happen")
-                        else:
-                            raise ValueError(f"Error: {resp.status}")
+                async with self.session.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 429:
+                        print("Rate limited, this shoudn't happen")
+                    else:
+                        raise ValueError(f"Error: {resp.status}")
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
                     print("Temporary failure in name resolution, retrying...")
@@ -173,19 +180,18 @@ class ScCrawler:
                 headers["Authorization"] = f"Bearer {self.accessToken}"
 
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        url,
-                        headers=headers,
-                        data=data,
-                    ) as resp:
-                        if resp.status == 200:
-                            return await resp.json()
-                        elif resp.status == 429:
-                            print("Rate limited, waiting 12 hours")
-                            await asyncio.sleep(60 * 60 * 12)
-                        else:
-                            raise ValueError(f"Error: {resp.status}")
+                async with self.session.post(
+                    url,
+                    headers=headers,
+                    data=data,
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 429:
+                        print("Rate limited, waiting 12 hours")
+                        await asyncio.sleep(60 * 60 * 12)
+                    else:
+                        raise ValueError(f"Error: {resp.status}")
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
                     print("Temporary failure in name resolution, retrying...")
@@ -339,21 +345,19 @@ class ScCrawler:
         return int(result[0]) if result and result[0] else 0
 
     async def insertTracks(self, userId: int, tracks: List):
-        for track in tracks:
-            await self.cursor.execute(
-                """
-                INSERT INTO tracks (userid, trackid, timestamp)
-                VALUES (?, ?, ?)
-                """,
-                (userId, track["id"], track["created_at"]),
-            )
+        await self.cursor.executemany(
+            """
+            INSERT INTO tracks (userid, trackid, timestamp)
+            VALUES (?, ?, ?)
+            """,
+            [(userId, track["id"], track["created_at"]) for track in tracks],
+        )
         await self.conn.commit()
 
     async def run(self):
         userId = await self.getUserId("psykko0")
         follows = await self.getFollowedUsers(userId)
         usernames = {user["id"]: user["username"] for user in follows}
-
 
         tasks = [
             self.getTracks(user["id"], until=await self.getLatestTimestamp(user["id"]))
@@ -372,12 +376,16 @@ class ScCrawler:
 async def main():
     crawler = ScCrawler(authMethod="client")
     await crawler.init()
-    while True:
-        start_time = time.time()
-        await crawler.run()
-        elapsed_time = time.time() - start_time
-        # sleep_time = max(0, (60 * 15) - elapsed_time)
-        # await asyncio.sleep(sleep_time)
+    try:
+        while True:
+            start_time = time.time()
+            await crawler.run()
+            elapsed_time = time.time() - start_time
+            sleep_time = max(0, (60 * 15) - elapsed_time)
+            print(f"Sleeping for ~{int(sleep_time/60)} minutes")
+            await asyncio.sleep(sleep_time)
+    finally:
+        await crawler.close()
 
 
 if __name__ == "__main__":
