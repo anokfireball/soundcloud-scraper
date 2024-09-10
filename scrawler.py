@@ -15,6 +15,7 @@ import aiohttp
 import aiosqlite
 from asynciolimiter import StrictLimiter
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 BASE = "https://api.soundcloud.com"
 
@@ -59,6 +60,7 @@ class ScCrawler:
         try:
             await self.readState()
         except FileNotFoundError:
+            # PKCE for SoundCloud
             self.state = "".join(
                 random.SystemRandom().choice(string.ascii_uppercase + string.digits)
                 for _ in range(64)
@@ -73,16 +75,15 @@ class ScCrawler:
 
             # await self.login("account")
 
+        # database
         self.conn = await aiosqlite.connect("scrawler.db")
         self.cursor = await self.conn.cursor()
-
-        # Create table if it doesn't exist
         await self.cursor.execute(
             """
         CREATE TABLE IF NOT EXISTS tracks (
             trackid INTEGER PRIMARY KEY,
             userid INTEGER NOT NULL,
-            timestamp TEXT NOT NULL
+            timestamp INTEGER NOT NULL
         )
         """
         )
@@ -280,7 +281,9 @@ class ScCrawler:
             url = res["next_href"]
         return followed
 
-    async def getTracks(self, userId: int, limit: int = 200) -> Tuple[int, List]:
+    async def getTracks(
+        self, userId: int, until: int = 0, limit: int = 199
+    ) -> Tuple[int, List]:
         tracks = []
         url = f"{BASE}/users/{userId}/tracks"
         while True:
@@ -293,16 +296,28 @@ class ScCrawler:
                 },
             )
             for track in res["collection"]:
+                track["created_at"] = int(
+                    datetime.datetime.strptime(
+                        track["created_at"], "%Y/%m/%d %H:%M:%S %z"
+                    ).timestamp()
+                )
                 tracks.append(track)
 
+            # tracks are fetched in descending order
+            # no need to go back further in time
             # we only want the most recent tracks
-            if len(tracks) >= 1:
+            if (
+                not any(track["created_at"] > until for track in res["collection"])
+                or len(tracks) >= 1
+            ):
                 break
 
             # paginate
             if "next_href" not in res or not res["next_href"]:
                 break
             url = res["next_href"]
+
+        tracks = list(filter(lambda x: x["created_at"] > until, tracks))
         return userId, tracks
 
     def filterSets(self, tracks: List) -> List:
@@ -311,22 +326,47 @@ class ScCrawler:
     def mostRecentTrack(self, tracks: List):
         return sorted(tracks, key=lambda x: x["created_at"], reverse=True)[0]
 
+    async def getLatestTimestamp(self, userId: int) -> int:
+        await self.cursor.execute(
+            """
+                SELECT MAX(timestamp)
+                FROM tracks
+                WHERE userid = ?
+                """,
+            (userId,),
+        )
+        result = await self.cursor.fetchone()
+        return int(result[0]) if result and result[0] else 0
+
+    async def insertTracks(self, userId: int, tracks: List):
+        for track in tracks:
+            await self.cursor.execute(
+                """
+                INSERT INTO tracks (userid, trackid, timestamp)
+                VALUES (?, ?, ?)
+                """,
+                (userId, track["id"], track["created_at"]),
+            )
+        await self.conn.commit()
+
     async def run(self):
         userId = await self.getUserId("psykko0")
         follows = await self.getFollowedUsers(userId)
+        usernames = {user["id"]: user["username"] for user in follows}
 
-        tasks = [self.getTracks(user["id"]) for user in follows]
-        i = 0
-        for task in asyncio.as_completed(tasks):
+
+        tasks = [
+            self.getTracks(user["id"], until=await self.getLatestTimestamp(user["id"]))
+            for user in follows
+        ]
+        pbar = tqdm(asyncio.as_completed(tasks), total=len(tasks))
+        for task in pbar:
             userId, tracks = await task
+            pbar.set_description(f"{usernames[userId][:30].ljust(30)}")
             sets = self.filterSets(tracks)
-            if not sets:
-                continue
-            mostRecent = self.mostRecentTrack(tracks)
-            print(mostRecent['permalink_url'])
-            # user = list(filter(lambda x: x["id"] == userId, follows))[0]
-            # print(f"[{i:3}/{len(tasks)}] - {user['username']} has {len(tracks)} tracks and {len(sets)} sets")
-            i += 1
+            for set in sets:
+                print(f"Found set: {set['title'], set['permalink_url']}")
+            await self.insertTracks(userId, tracks)
 
 
 async def main():
@@ -336,8 +376,8 @@ async def main():
         start_time = time.time()
         await crawler.run()
         elapsed_time = time.time() - start_time
-        sleep_time = max(0, (60 * 15) - elapsed_time)
-        await asyncio.sleep(sleep_time)
+        # sleep_time = max(0, (60 * 15) - elapsed_time)
+        # await asyncio.sleep(sleep_time)
 
 
 if __name__ == "__main__":
