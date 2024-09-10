@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import datetime
+import email.utils
 import hashlib
 import json
 import os
@@ -157,7 +158,7 @@ class ScCrawler:
                     elif resp.status == 429:
                         print("Rate limited, this shoudn't happen")
                     else:
-                        raise ValueError(f"Error: {resp.status}")
+                        print(f"Error: {resp.status}")
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
                     print("Temporary failure in name resolution, retrying...")
@@ -191,7 +192,7 @@ class ScCrawler:
                         print("Rate limited, waiting 12 hours")
                         await asyncio.sleep(60 * 60 * 12)
                     else:
-                        raise ValueError(f"Error: {resp.status}")
+                        print(f"Error: {resp.status}")
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
                     print("Temporary failure in name resolution, retrying...")
@@ -288,7 +289,7 @@ class ScCrawler:
         return followed
 
     async def getTracks(
-        self, userId: int, until: int = 0, limit: int = 199
+        self, userId: int, until: int = 0, limit: int = 200
     ) -> Tuple[int, List]:
         tracks = []
         url = f"{BASE}/users/{userId}/tracks"
@@ -354,10 +355,22 @@ class ScCrawler:
         )
         await self.conn.commit()
 
+    async def triggerWebhook(self, artist: dict, track: dict):
+        created_at = datetime.datetime.fromtimestamp(track["created_at"], tz=datetime.timezone.utc)
+        await self.session.post(
+            WEBHOOK,
+            json={
+                "artist": artist["username"],
+                "title": track["title"],
+                "url": track["permalink_url"],
+                "date": email.utils.format_datetime(created_at, usegmt=True),
+            },
+        )
+
     async def run(self):
-        userId = await self.getUserId("psykko0")
+        userId = await self.getUserId(SOUNDCLOUD_USERNAME)
         follows = await self.getFollowedUsers(userId)
-        usernames = {user["id"]: user["username"] for user in follows}
+        userMap = {user["id"]: user for user in follows}
 
         tasks = [
             self.getTracks(user["id"], until=await self.getLatestTimestamp(user["id"]))
@@ -366,10 +379,11 @@ class ScCrawler:
         pbar = tqdm(asyncio.as_completed(tasks), total=len(tasks))
         for task in pbar:
             userId, tracks = await task
-            pbar.set_description(f"{usernames[userId][:30].ljust(30)}")
+            artist = userMap[userId]
+            pbar.set_description(f"{artist['username'][:30].ljust(30)}")
             sets = self.filterSets(tracks)
             for set in sets:
-                print(f"Found set: {set['title'], set['permalink_url']}")
+                await self.triggerWebhook(artist, set)
             await self.insertTracks(userId, tracks)
 
 
@@ -391,6 +405,8 @@ async def main():
 if __name__ == "__main__":
     load_dotenv(".env")
     try:
+        WEBHOOK = os.getenv("WEBHOOK")
+        SOUNDCLOUD_USERNAME = os.getenv("SOUNDCLOUD_USERNAME")
         CLIENT_ID = os.getenv("CLIENT_ID")
         CLIENT_SECRET = os.getenv("CLIENT_SECRET")
         REDIRECT_URI = os.getenv("REDIRECT_URI")
