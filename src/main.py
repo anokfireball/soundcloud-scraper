@@ -63,11 +63,15 @@ class ScCrawler:
         self.cursor = None
         self.session = None
 
+        hash = hashlib.sha256()
+        hash.update(SOUNDCLOUD_USERNAME.encode("utf-8"))
+        self.sessionSuffix = hash.hexdigest()[:16]
+
     async def init(self):
         await self.readState()
 
         # database
-        self.conn = await aiosqlite.connect("scrawler.db")
+        self.conn = await aiosqlite.connect(os.path.join(DATA_DIR, f"{self.sessionSuffix}.db"))
         self.cursor = await self.conn.cursor()
         await self.cursor.execute(
             """
@@ -106,12 +110,13 @@ class ScCrawler:
             state["state"] = self.state
             state["code"] = self.code
 
-        with open(".state", "w") as f:
+        with open(os.path.join(DATA_DIR, f"{self.sessionSuffix}.state"), "w") as f:
             json.dump(state, f, default=custom_encoder)
 
     async def readState(self):
-        if os.path.exists(".state"):
-            with open(".state", "r") as f:
+        path = os.path.join(DATA_DIR, f"{self.sessionSuffix}.state")
+        if os.path.exists(path):
+            with open(path, "r") as f:
                 state = json.load(f, object_hook=custom_decoder)
 
             self.accessToken = state["accessToken"]
@@ -412,14 +417,18 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        WEBHOOK = os.environ["WEBHOOK"]
+        DATA_DIR = os.environ["DATA_DIR"]
         SOUNDCLOUD_USERNAME = os.environ["SOUNDCLOUD_USERNAME"]
         API_CLIENT_ID = os.environ["API_CLIENT_ID"]
         API_CLIENT_SECRET = os.environ["API_CLIENT_SECRET"]
         API_REDIRECT_URI = os.environ["API_REDIRECT_URI"]
+        WEBHOOK = os.environ["WEBHOOK"]
     except KeyError as e:
         print(f"Please provide {e} as environment variable")
         exit(1)
+
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())

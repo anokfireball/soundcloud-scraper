@@ -1,6 +1,4 @@
 .env
 .venv/
 
-.state
-*.db*
-*.session*
+data/
