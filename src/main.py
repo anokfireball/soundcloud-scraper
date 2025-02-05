@@ -39,9 +39,9 @@ def custom_decoder(dct):
     return dct
 
 
-class ScCrawler:
-    def __init__(self, authMethod=AuthMethod.CLIENT):
-        self.authMethod = authMethod
+class Crawler:
+    def __init__(self):
+        self.authMethod = AuthMethod(API_AUTH_METHOD)
 
         # https://github.com/soundcloud/api/issues/182#issuecomment-1036138170
         self.searchLimiter = StrictLimiter(25000 / 3600)
@@ -167,9 +167,9 @@ class ScCrawler:
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 429:
-                        print("Rate limited, this shoudn't happen")
+                        print("Rate limited, this shouldn't happen")
                     else:
-                        print(f"Got HTTP {resp.status} ({url})")
+                        print(f"Got HTTP {resp.status}, retrying... ({url})")
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
                     print("Temporary failure in name resolution, retrying...")
@@ -203,7 +203,7 @@ class ScCrawler:
                         print("Rate limited, waiting 12 hours")
                         await asyncio.sleep(60 * 60 * 12)
                     else:
-                        print(f"{resp.status} ({url})")
+                        print(f"Got HTTP {resp.status}, retrying... ({url})")
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
                     print("Temporary failure in name resolution, retrying...")
@@ -256,15 +256,12 @@ class ScCrawler:
                 },
                 withAuth=False,
             )
-        else:
-            raise ValueError(f"Invalid authMethod: {self.authMethod}")
         self.setTokens(res)
         await self.writeState()
 
     async def reauth(self):
         print("Refreshing token")
-        if self.authMethod == AuthMethod.CLIENT:
-            await self.clientCredentialLimiter.wait()
+        await self.clientCredentialLimiter.wait()
 
         res = await self.post(
             url="https://secure.soundcloud.com/oauth/token",
@@ -400,7 +397,7 @@ class ScCrawler:
 
 
 async def main():
-    crawler = ScCrawler(authMethod=AuthMethod.CLIENT)
+    crawler = Crawler()
     await crawler.init()
     try:
         while True:
@@ -421,6 +418,7 @@ if __name__ == "__main__":
         ONESHOT = os.environ["ONESHOT"].lower().strip() in ["true", "1", "t", "y", "yes"]
         DATA_DIR = os.environ["DATA_DIR"]
         SOUNDCLOUD_USERNAME = os.environ["SOUNDCLOUD_USERNAME"]
+        API_AUTH_METHOD = os.environ["API_AUTH_METHOD"]
         API_CLIENT_ID = os.environ["API_CLIENT_ID"]
         API_CLIENT_SECRET = os.environ["API_CLIENT_SECRET"]
         API_REDIRECT_URI = os.environ["API_REDIRECT_URI"]
