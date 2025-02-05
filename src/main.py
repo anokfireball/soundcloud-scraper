@@ -366,13 +366,16 @@ class Crawler:
 
     async def triggerWebhook(self, artist: dict, track: dict):
         created_at = datetime.datetime.fromtimestamp(track["created_at"], tz=datetime.timezone.utc)
+        date = email.utils.format_datetime(created_at, usegmt=True)
         await self.session.post(
             WEBHOOK,
             json={
+                "trackid": track["id"],
                 "artist": artist["username"],
                 "title": track["title"],
                 "url": track["permalink_url"],
-                "date": email.utils.format_datetime(created_at, usegmt=True),
+                "timestamp": track["created_at"],
+                "date": date
             },
         )
 
