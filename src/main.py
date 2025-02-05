@@ -10,16 +10,19 @@ import re
 import string
 import time
 import urllib.parse
+from enum import Enum
 from typing import Dict, List, Tuple
 
 import aiohttp
 import aiosqlite
 from asynciolimiter import StrictLimiter
-from dotenv import load_dotenv
 from tqdm import tqdm
 
 BASE = "https://api.soundcloud.com"
 
+class AuthMethod(Enum):
+    CLIENT = "client"
+    USER = "user"
 
 def custom_encoder(obj):
     if isinstance(obj, datetime.datetime):
@@ -37,7 +40,7 @@ def custom_decoder(dct):
 
 
 class ScCrawler:
-    def __init__(self, authMethod="client"):
+    def __init__(self, authMethod=AuthMethod.CLIENT):
         self.authMethod = authMethod
 
         # https://github.com/soundcloud/api/issues/182#issuecomment-1036138170
@@ -45,13 +48,15 @@ class ScCrawler:
         # https://developers.soundcloud.com/docs/api/guide#authentication
         self.clientCredentialLimiter = StrictLimiter(50 / (12 * 3600))
 
-        self.codeChallenge = None
-        self.codeVerifier = None
-        self.state = None
-        self.code = None
         self.accessToken = None
         self.refreshToken = None
         self.tokenExpires = None
+
+        if self.authMethod == AuthMethod.USER:
+            self.codeChallenge = None
+            self.codeVerifier = None
+            self.state = None
+            self.code = None
 
         # TODO when and how to clean these up?
         self.conn = None
@@ -59,23 +64,7 @@ class ScCrawler:
         self.session = None
 
     async def init(self):
-        try:
-            await self.readState()
-        except FileNotFoundError:
-            # PKCE for SoundCloud
-            self.state = "".join(
-                random.SystemRandom().choice(string.ascii_uppercase + string.digits)
-                for _ in range(64)
-            )
-
-            code_verifier = base64.urlsafe_b64encode(os.urandom(40)).decode("utf-8")
-            self.codeVerifier = re.sub("[^a-zA-Z0-9]+", "", code_verifier)
-
-            code_challenge = hashlib.sha256(code_verifier.encode("utf-8")).digest()
-            code_challenge = base64.urlsafe_b64encode(code_challenge).decode("utf-8")
-            self.codeChallenge = code_challenge.replace("=", "")
-
-            # await self.login("account")
+        await self.readState()
 
         # database
         self.conn = await aiosqlite.connect("scrawler.db")
@@ -107,29 +96,47 @@ class ScCrawler:
 
     async def writeState(self):
         state = {
-            "codeChallenge": self.codeChallenge,
-            "codeVerifier": self.codeVerifier,
-            "state": self.state,
-            "code": self.code,
             "accessToken": self.accessToken,
             "refreshToken": self.refreshToken,
             "tokenExpires": self.tokenExpires,
         }
+        if self.authMethod == AuthMethod.USER:
+            state["codeChallenge"] = self.codeChallenge
+            state["codeVerifier"] = self.codeVerifier
+            state["state"] = self.state
+            state["code"] = self.code
 
         with open(".state", "w") as f:
             json.dump(state, f, default=custom_encoder)
 
     async def readState(self):
-        with open(".state", "r") as f:
-            state = json.load(f, object_hook=custom_decoder)
+        if os.path.exists(".state"):
+            with open(".state", "r") as f:
+                state = json.load(f, object_hook=custom_decoder)
 
-        self.codeChallenge = state["codeChallenge"]
-        self.codeVerifier = state["codeVerifier"]
-        self.state = state["state"]
+            self.accessToken = state["accessToken"]
+            self.refreshToken = state["refreshToken"]
+            self.tokenExpires = state["tokenExpires"]
 
-        self.accessToken = state["accessToken"]
-        self.refreshToken = state["refreshToken"]
-        self.tokenExpires = state["tokenExpires"]
+            if self.authMethod == AuthMethod.USER:
+                self.codeChallenge = state["codeChallenge"]
+                self.codeVerifier = state["codeVerifier"]
+                self.state = state["state"]
+        elif self.authMethod == AuthMethod.USER:
+                # PKCE for SoundCloud
+                self.state = "".join(
+                    random.SystemRandom().choice(string.ascii_uppercase + string.digits)
+                    for _ in range(64)
+                )
+
+                code_verifier = base64.urlsafe_b64encode(os.urandom(40)).decode("utf-8")
+                self.codeVerifier = re.sub("[^a-zA-Z0-9]+", "", code_verifier)
+
+                code_challenge = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+                code_challenge = base64.urlsafe_b64encode(code_challenge).decode("utf-8")
+                self.codeChallenge = code_challenge.replace("=", "")
+
+                await self.login(AuthMethod.USER)
 
     async def get(
         self, url: str, headers: dict = {}, params: dict = None, withAuth=True
@@ -201,9 +208,9 @@ class ScCrawler:
                     raise e
 
     async def login(self, authMethod):
-        if authMethod == "client":
+        if authMethod == AuthMethod.CLIENT:
             basicAuth = base64.b64encode(
-                f"{CLIENT_ID}:{CLIENT_SECRET}".encode("utf-8")
+                f"{API_CLIENT_ID}:{API_CLIENT_SECRET}".encode("utf-8")
             ).decode("utf-8")
 
             await self.clientCredentialLimiter.wait()
@@ -216,17 +223,18 @@ class ScCrawler:
                 data={"grant_type": "client_credentials"},
                 withAuth=False,
             )
-        elif authMethod == "account":
+        elif authMethod == AuthMethod.USER:
             url = (
                 "https://secure.soundcloud.com/authorize?"
-                + f"client_id={urllib.parse.quote_plus(CLIENT_ID.encode('utf-8'))}&"
-                + f"redirect_uri={urllib.parse.quote_plus(REDIRECT_URI.encode('utf-8'))}&"
+                + f"API_CLIENT_ID={urllib.parse.quote_plus(API_CLIENT_ID.encode('utf-8'))}&"
+                + f"API_REDIRECT_URI={urllib.parse.quote_plus(API_REDIRECT_URI.encode('utf-8'))}&"
                 + "response_type=code&"
                 + f"code_challenge={urllib.parse.quote_plus(self.codeChallenge.encode('utf-8'))}&"
                 + "code_challenge_method=S256&"
                 + f"state={urllib.parse.quote_plus(self.state.encode('utf-8'))}"
             )
 
+            # TODO have a listener on API_REDIRECT_URI, parse it automatically
             print(f"Please visit and authenticate: {url}")
             self.code = input("Please enter the received CODE: ")
 
@@ -236,9 +244,9 @@ class ScCrawler:
                 url="https://secure.soundcloud.com/oauth/token",
                 data={
                     "grant_type": "authorization_code",
-                    "client_id": CLIENT_ID,
-                    "client_secret": CLIENT_SECRET,
-                    "redirect_uri": REDIRECT_URI,
+                    "API_CLIENT_ID": API_CLIENT_ID,
+                    "API_CLIENT_SECRET": API_CLIENT_SECRET,
+                    "API_REDIRECT_URI": API_REDIRECT_URI,
                     "code_verifier": self.codeVerifier,
                     "code": self.code,
                 },
@@ -251,15 +259,15 @@ class ScCrawler:
 
     async def reauth(self):
         print("Refreshing token")
-        if self.authMethod == "client":
+        if self.authMethod == AuthMethod.CLIENT:
             await self.clientCredentialLimiter.wait()
 
         res = await self.post(
             url="https://secure.soundcloud.com/oauth/token",
             data={
                 "grant_type": "refresh_token",
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
+                "API_CLIENT_ID": API_CLIENT_ID,
+                "API_CLIENT_SECRET": API_CLIENT_SECRET,
                 "refresh_token": self.refreshToken,
             },
             withAuth=False,
@@ -310,7 +318,7 @@ class ScCrawler:
                 )
                 tracks.append(track)
 
-            # tracks are fetched in descending order
+            # tracks are fetched in (chronologically) descending order
             # no need to go back further in time
             # we only want the most recent tracks
             if (
@@ -388,7 +396,7 @@ class ScCrawler:
 
 
 async def main():
-    crawler = ScCrawler(authMethod="client")
+    crawler = ScCrawler(authMethod=AuthMethod.CLIENT)
     await crawler.init()
     try:
         while True:
@@ -403,17 +411,14 @@ async def main():
 
 
 if __name__ == "__main__":
-    load_dotenv(".env")
     try:
-        WEBHOOK = os.getenv("WEBHOOK")
-        SOUNDCLOUD_USERNAME = os.getenv("SOUNDCLOUD_USERNAME")
-        CLIENT_ID = os.getenv("CLIENT_ID")
-        CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-        REDIRECT_URI = os.getenv("REDIRECT_URI")
-    except KeyError:
-        print(
-            "Please provide CLIENT_ID, CLIENT_SECRET, and REDIRECT_URI in .env file or as environment variables"
-        )
+        WEBHOOK = os.environ["WEBHOOK"]
+        SOUNDCLOUD_USERNAME = os.environ["SOUNDCLOUD_USERNAME"]
+        API_CLIENT_ID = os.environ["API_CLIENT_ID"]
+        API_CLIENT_SECRET = os.environ["API_CLIENT_SECRET"]
+        API_REDIRECT_URI = os.environ["API_REDIRECT_URI"]
+    except KeyError as e:
+        print(f"Please provide {e} as environment variable")
         exit(1)
 
     loop = asyncio.get_event_loop()
