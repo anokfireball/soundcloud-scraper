@@ -58,7 +58,6 @@ class ScCrawler:
             self.state = None
             self.code = None
 
-        # TODO when and how to clean these up?
         self.conn = None
         self.cursor = None
         self.session = None
@@ -170,7 +169,7 @@ class ScCrawler:
                     elif resp.status == 429:
                         print("Rate limited, this shoudn't happen")
                     else:
-                        print(f"Error: {resp.status}")
+                        print(f"Got HTTP {resp.status} ({url})")
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
                     print("Temporary failure in name resolution, retrying...")
@@ -204,7 +203,7 @@ class ScCrawler:
                         print("Rate limited, waiting 12 hours")
                         await asyncio.sleep(60 * 60 * 12)
                     else:
-                        print(f"Error: {resp.status}")
+                        print(f"{resp.status} ({url})")
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
                     print("Temporary failure in name resolution, retrying...")
@@ -407,6 +406,8 @@ async def main():
         while True:
             start_time = time.time()
             await crawler.run()
+            if ONESHOT:
+               break
             elapsed_time = time.time() - start_time
             sleep_time = max(0, (60 * 15) - elapsed_time)
             print(f"Sleeping for ~{int(sleep_time/60)} minutes")
@@ -417,6 +418,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        ONESHOT = os.environ["ONESHOT"].lower().strip() in ["true", "1", "t", "y", "yes"]
         DATA_DIR = os.environ["DATA_DIR"]
         SOUNDCLOUD_USERNAME = os.environ["SOUNDCLOUD_USERNAME"]
         API_CLIENT_ID = os.environ["API_CLIENT_ID"]
@@ -430,6 +432,4 @@ if __name__ == "__main__":
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
-    loop.close()
+    asyncio.run(main())
