@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import base64
 import datetime
@@ -15,14 +16,18 @@ from typing import Dict, List, Tuple
 
 import aiohttp
 import aiosqlite
-from asynciolimiter import StrictLimiter
+from asynciolimiter import LeakyBucketLimiter, StrictLimiter
 from tqdm import tqdm
 
 BASE = "https://api.soundcloud.com"
+AUTH_BASE = "https://secure.soundcloud.com"
+TOKEN_REFRESH_THRESHOLD = 3 * 60
+
 
 class AuthMethod(Enum):
     CLIENT = "client"
     USER = "user"
+
 
 def custom_encoder(obj):
     if isinstance(obj, datetime.datetime):
@@ -44,10 +49,21 @@ class Crawler:
         self.authMethod = AuthMethod(API_AUTH_METHOD)
 
         # https://github.com/soundcloud/api/issues/182#issuecomment-1036138170
-        self.searchLimiter = StrictLimiter(25000 / 3600)
+        self.searchLimiter = StrictLimiter(27500 / 3600)
         # https://developers.soundcloud.com/docs/api/guide#authentication
-        self.clientCredentialLimiter = StrictLimiter(50 / (12 * 3600))
+        self.clientCredentialLimiter = LeakyBucketLimiter(45 / (12 * 3600), capacity=5)
 
+        self.initState()
+
+        self.conn = None
+        self.cursor = None
+        self.session = None
+
+        hash = hashlib.sha256()
+        hash.update(SOUNDCLOUD_USERNAME.encode("utf-8"))
+        self.sessionSuffix = hash.hexdigest()[:16]
+
+    def initState(self):
         self.accessToken = None
         self.refreshToken = None
         self.tokenExpires = None
@@ -58,19 +74,13 @@ class Crawler:
             self.state = None
             self.code = None
 
-        self.conn = None
-        self.cursor = None
-        self.session = None
-
-        hash = hashlib.sha256()
-        hash.update(SOUNDCLOUD_USERNAME.encode("utf-8"))
-        self.sessionSuffix = hash.hexdigest()[:16]
-
     async def init(self):
         await self.readState()
 
         # database
-        self.conn = await aiosqlite.connect(os.path.join(DATA_DIR, f"{self.sessionSuffix}.db"))
+        self.conn = await aiosqlite.connect(
+            os.path.join(DATA_DIR, f"{self.sessionSuffix}.db")
+        )
         self.cursor = await self.conn.cursor()
         await self.cursor.execute(
             """
@@ -127,20 +137,20 @@ class Crawler:
                 self.codeVerifier = state["codeVerifier"]
                 self.state = state["state"]
         elif self.authMethod == AuthMethod.USER:
-                # PKCE for SoundCloud
-                self.state = "".join(
-                    random.SystemRandom().choice(string.ascii_uppercase + string.digits)
-                    for _ in range(64)
-                )
+            # PKCE for SoundCloud
+            self.state = "".join(
+                random.SystemRandom().choice(string.ascii_uppercase + string.digits)
+                for _ in range(64)
+            )
 
-                code_verifier = base64.urlsafe_b64encode(os.urandom(40)).decode("utf-8")
-                self.codeVerifier = re.sub("[^a-zA-Z0-9]+", "", code_verifier)
+            code_verifier = base64.urlsafe_b64encode(os.urandom(40)).decode("utf-8")
+            self.codeVerifier = re.sub("[^a-zA-Z0-9]+", "", code_verifier)
 
-                code_challenge = hashlib.sha256(code_verifier.encode("utf-8")).digest()
-                code_challenge = base64.urlsafe_b64encode(code_challenge).decode("utf-8")
-                self.codeChallenge = code_challenge.replace("=", "")
+            code_challenge = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+            code_challenge = base64.urlsafe_b64encode(code_challenge).decode("utf-8")
+            self.codeChallenge = code_challenge.replace("=", "")
 
-                await self.login(AuthMethod.USER)
+            await self.login(AuthMethod.USER)
 
     async def get(
         self, url: str, headers: dict = {}, params: dict = None, withAuth=True
@@ -148,12 +158,7 @@ class Crawler:
         while True:
             headers["accept"] = "application/json; charset=utf-8"
             if withAuth:
-                if self.accessToken is None:
-                    await self.login(self.authMethod)
-                if datetime.datetime.now() > (
-                    self.tokenExpires - datetime.timedelta(seconds=30)
-                ):
-                    await self.reauth()
+                await self.reauth()
                 headers["Authorization"] = f"Bearer {self.accessToken}"
 
             await self.searchLimiter.wait()
@@ -183,12 +188,7 @@ class Crawler:
         while True:
             headers["accept"] = "application/json; charset=utf-8"
             if withAuth:
-                if self.accessToken is None:
-                    await self.login()
-                if datetime.datetime.now() > (
-                    self.tokenExpires + datetime.timedelta(seconds=30)
-                ):
-                    await self.reauth()
+                await self.reauth()
                 headers["Authorization"] = f"Bearer {self.accessToken}"
 
             try:
@@ -203,7 +203,7 @@ class Crawler:
                         print("Rate limited, waiting 12 hours")
                         await asyncio.sleep(60 * 60 * 12)
                     else:
-                        print(f"Got HTTP {resp.status}, retrying... ({url})")
+                        print(f"Got HTTP {resp.status}, retrying... ({url}, {data})")
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
                     print("Temporary failure in name resolution, retrying...")
@@ -220,7 +220,7 @@ class Crawler:
             await self.clientCredentialLimiter.wait()
 
             res = await self.post(
-                url="https://secure.soundcloud.com/oauth/token",
+                url=f"{AUTH_BASE}/oauth/token",
                 headers={
                     "Authorization": f"Basic {basicAuth}",
                 },
@@ -229,9 +229,9 @@ class Crawler:
             )
         elif authMethod == AuthMethod.USER:
             url = (
-                "https://secure.soundcloud.com/authorize?"
-                + f"API_CLIENT_ID={urllib.parse.quote_plus(API_CLIENT_ID.encode('utf-8'))}&"
-                + f"API_REDIRECT_URI={urllib.parse.quote_plus(API_REDIRECT_URI.encode('utf-8'))}&"
+                f"{AUTH_BASE}/authorize?"
+                + f"client_id={urllib.parse.quote_plus(API_CLIENT_ID.encode('utf-8'))}&"
+                + f"redirect_uri={urllib.parse.quote_plus(API_REDIRECT_URI.encode('utf-8'))}&"
                 + "response_type=code&"
                 + f"code_challenge={urllib.parse.quote_plus(self.codeChallenge.encode('utf-8'))}&"
                 + "code_challenge_method=S256&"
@@ -245,12 +245,12 @@ class Crawler:
             await asyncio.sleep(5)
 
             res = await self.post(
-                url="https://secure.soundcloud.com/oauth/token",
+                url=f"{AUTH_BASE}/oauth/token",
                 data={
                     "grant_type": "authorization_code",
-                    "API_CLIENT_ID": API_CLIENT_ID,
-                    "API_CLIENT_SECRET": API_CLIENT_SECRET,
-                    "API_REDIRECT_URI": API_REDIRECT_URI,
+                    "client_id": API_CLIENT_ID,
+                    "client_secret": API_CLIENT_SECRET,
+                    "redirect_uri": API_REDIRECT_URI,
                     "code_verifier": self.codeVerifier,
                     "code": self.code,
                 },
@@ -260,15 +260,25 @@ class Crawler:
         await self.writeState()
 
     async def reauth(self):
-        print("Refreshing token")
-        await self.clientCredentialLimiter.wait()
+        remaining = self.tokenExpires - datetime.datetime.now() or datetime.timedelta(
+            seconds=0
+        )
+        if self.accessToken is None or remaining < datetime.timedelta(seconds=5):
+            print("No valid token, performing full reauth")
+            await self.login(self.authMethod)
+            return
 
+        if remaining > datetime.timedelta(seconds=TOKEN_REFRESH_THRESHOLD):
+            return
+
+        print(f"Token close to expiry ({int(remaining.total_seconds())}s), refreshing")
+        await self.searchLimiter.wait()
         res = await self.post(
-            url="https://secure.soundcloud.com/oauth/token",
+            url=f"{AUTH_BASE}/oauth/token",
             data={
                 "grant_type": "refresh_token",
-                "API_CLIENT_ID": API_CLIENT_ID,
-                "API_CLIENT_SECRET": API_CLIENT_SECRET,
+                "client_id": API_CLIENT_ID,
+                "client_secret": API_CLIENT_SECRET,
                 "refresh_token": self.refreshToken,
             },
             withAuth=False,
@@ -365,7 +375,9 @@ class Crawler:
         await self.conn.commit()
 
     async def triggerWebhook(self, artist: dict, track: dict):
-        created_at = datetime.datetime.fromtimestamp(track["created_at"], tz=datetime.timezone.utc)
+        created_at = datetime.datetime.fromtimestamp(
+            track["created_at"], tz=datetime.timezone.utc
+        )
         date = email.utils.format_datetime(created_at, usegmt=True)
         await self.session.post(
             WEBHOOK,
@@ -375,7 +387,7 @@ class Crawler:
                 "title": track["title"],
                 "url": track["permalink_url"],
                 "timestamp": track["created_at"],
-                "date": date
+                "date": date,
             },
         )
 
@@ -407,7 +419,7 @@ async def main():
             start_time = time.time()
             await crawler.run()
             if ONESHOT:
-               break
+                break
             elapsed_time = time.time() - start_time
             sleep_time = max(0, (60 * 15) - elapsed_time)
             print(f"Sleeping for ~{int(sleep_time/60)} minutes")
@@ -418,7 +430,13 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        ONESHOT = os.environ["ONESHOT"].lower().strip() in ["true", "1", "t", "y", "yes"]
+        ONESHOT = os.environ["ONESHOT"].lower().strip() in [
+            "true",
+            "1",
+            "t",
+            "y",
+            "yes",
+        ]
         DATA_DIR = os.environ["DATA_DIR"]
         SOUNDCLOUD_USERNAME = os.environ["SOUNDCLOUD_USERNAME"]
         API_AUTH_METHOD = os.environ["API_AUTH_METHOD"]
