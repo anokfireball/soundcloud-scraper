@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import base64
 import datetime
@@ -9,6 +8,7 @@ import os
 import random
 import re
 import string
+import sys
 import time
 import urllib.parse
 from enum import Enum
@@ -17,11 +17,13 @@ from typing import Dict, List, Tuple
 import aiohttp
 import aiosqlite
 from asynciolimiter import LeakyBucketLimiter, StrictLimiter
-from tqdm import tqdm
+from loguru import logger
 
 BASE = "https://api.soundcloud.com"
 AUTH_BASE = "https://secure.soundcloud.com"
 TOKEN_REFRESH_THRESHOLD = 3 * 60
+LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+LOG_DESTINATION = sys.stdout
 
 
 class AuthMethod(Enum):
@@ -75,12 +77,12 @@ class Crawler:
             self.code = None
 
     async def init(self):
+        logger.debug("Initializing Crawler")
         await self.readState()
 
         # database
-        self.conn = await aiosqlite.connect(
-            os.path.join(DATA_DIR, f"{self.sessionSuffix}.db")
-        )
+        dbPath = os.path.join(DATA_DIR, f"{self.sessionSuffix}.db")
+        self.conn = await aiosqlite.connect(os.path.join(dbPath))
         self.cursor = await self.conn.cursor()
         await self.cursor.execute(
             """
@@ -92,6 +94,7 @@ class Crawler:
         """
         )
         await self.conn.commit()
+        logger.debug(f"Connected to database {dbPath}.db')")
 
         # Create a single aiohttp session
         self.session = aiohttp.ClientSession()
@@ -125,6 +128,7 @@ class Crawler:
     async def readState(self):
         path = os.path.join(DATA_DIR, f"{self.sessionSuffix}.state")
         if os.path.exists(path):
+            logger.info(f"Reading existing state from {path}")
             with open(path, "r") as f:
                 state = json.load(f, object_hook=custom_decoder)
 
@@ -137,6 +141,7 @@ class Crawler:
                 self.codeVerifier = state["codeVerifier"]
                 self.state = state["state"]
         elif self.authMethod == AuthMethod.USER:
+            logger.info("No existing state found, authencating from scratch")
             # PKCE for SoundCloud
             self.state = "".join(
                 random.SystemRandom().choice(string.ascii_uppercase + string.digits)
@@ -169,15 +174,16 @@ class Crawler:
                     headers=headers,
                     params=params,
                 ) as resp:
+                    logger.debug(f"GET {url} {headers} {params}")
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 429:
-                        print("Rate limited, this shouldn't happen")
+                        logger.warning("Rate limited, this shouldn't happen")
                     else:
-                        print(f"Got HTTP {resp.status}, retrying... ({url})")
+                        logger.error(f"Got HTTP {resp.status}, retrying... ({url})")
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
-                    print("Temporary failure in name resolution, retrying...")
+                    logger.error("Temporary failure in name resolution, retrying...")
                     await asyncio.sleep(10)
                 else:
                     raise e
@@ -197,22 +203,26 @@ class Crawler:
                     headers=headers,
                     data=data,
                 ) as resp:
+                    logger.debug(f"POST {url} {headers} {data}")
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 429:
-                        print("Rate limited, waiting 12 hours")
+                        logger.warning("Rate limited, waiting 12 hours")
                         await asyncio.sleep(60 * 60 * 12)
                     else:
-                        print(f"Got HTTP {resp.status}, retrying... ({url}, {data})")
+                        logger.error(
+                            f"Got HTTP {resp.status}, retrying... ({url}, {data})"
+                        )
             except aiohttp.client_exceptions.ClientConnectorError as e:
                 if "Temporary failure in name resolution" in str(e):
-                    print("Temporary failure in name resolution, retrying...")
+                    logger.error("Temporary failure in name resolution, retrying...")
                     await asyncio.sleep(10)
                 else:
                     raise e
 
     async def login(self, authMethod):
         if authMethod == AuthMethod.CLIENT:
+            logger.info("Logging in with client credentials")
             basicAuth = base64.b64encode(
                 f"{API_CLIENT_ID}:{API_CLIENT_SECRET}".encode("utf-8")
             ).decode("utf-8")
@@ -228,6 +238,7 @@ class Crawler:
                 withAuth=False,
             )
         elif authMethod == AuthMethod.USER:
+            logger.info("Logging in with user credentials")
             url = (
                 f"{AUTH_BASE}/authorize?"
                 + f"client_id={urllib.parse.quote_plus(API_CLIENT_ID.encode('utf-8'))}&"
@@ -257,6 +268,7 @@ class Crawler:
                 withAuth=False,
             )
         self.setTokens(res)
+        logger.info(f"Login successful, token valid until {self.tokenExpires}")
         await self.writeState()
 
     async def reauth(self):
@@ -264,14 +276,16 @@ class Crawler:
             seconds=0
         )
         if self.accessToken is None or remaining < datetime.timedelta(seconds=5):
-            print("No valid token, performing full reauth")
+            logger.info("No valid token, performing full reauth")
             await self.login(self.authMethod)
             return
 
         if remaining > datetime.timedelta(seconds=TOKEN_REFRESH_THRESHOLD):
             return
 
-        print(f"Token close to expiry ({int(remaining.total_seconds())}s), refreshing")
+        logger.info(
+            f"Token close to expiry ({int(remaining.total_seconds())}s), refreshing"
+        )
         await self.searchLimiter.wait()
         res = await self.post(
             url=f"{AUTH_BASE}/oauth/token",
@@ -291,6 +305,7 @@ class Crawler:
             url=f"{BASE}/resolve",
             params={"url": f"https://soundcloud.com/{username}"},
         )
+        logger.debug(f"Resolved {username} to ID {res['id']}")
         return res["id"]
 
     async def getFollowedUsers(self, userId: int) -> List:
@@ -305,10 +320,11 @@ class Crawler:
             if "next_href" not in res or not res["next_href"]:
                 break
             url = res["next_href"]
+        logger.debug(f"Found {len(followed)} followed accounts")
         return followed
 
     async def getTracks(
-        self, userId: int, until: int = 0, limit: int = 200
+        self, userId: int, userName: str, until: int = 0, limit: int = 200
     ) -> Tuple[int, List]:
         tracks = []
         url = f"{BASE}/users/{userId}/tracks"
@@ -344,6 +360,10 @@ class Crawler:
             url = res["next_href"]
 
         tracks = list(filter(lambda x: x["created_at"] > until, tracks))
+        logger.info(
+            f"Found {len(tracks)} tracks for {userName} ({userId}) after "
+            + f" {datetime.datetime.fromtimestamp(until).strftime('%Y/%m/%d %H:%M:%S')}"
+        )
         return userId, tracks
 
     def filterSets(self, tracks: List) -> List:
@@ -379,16 +399,18 @@ class Crawler:
             track["created_at"], tz=datetime.timezone.utc
         )
         date = email.utils.format_datetime(created_at, usegmt=True)
+        payload = {
+            "trackid": track["id"],
+            "artist": artist["username"],
+            "title": track["title"],
+            "url": track["permalink_url"],
+            "timestamp": track["created_at"],
+            "date": date,
+        }
+        logger.debug(f"Triggering webhook with payload: {payload}")
         await self.session.post(
             WEBHOOK,
-            json={
-                "trackid": track["id"],
-                "artist": artist["username"],
-                "title": track["title"],
-                "url": track["permalink_url"],
-                "timestamp": track["created_at"],
-                "date": date,
-            },
+            json=payload,
         )
 
     async def run(self):
@@ -400,20 +422,30 @@ class Crawler:
             self.getTracks(user["id"], until=await self.getLatestTimestamp(user["id"]))
             for user in follows
         ]
-        pbar = tqdm(asyncio.as_completed(tasks), total=len(tasks))
-        for task in pbar:
+        for task in asyncio.as_completed(tasks):
             userId, tracks = await task
-            artist = userMap[userId]
-            pbar.set_description(f"{artist['username'][:30].ljust(30)}")
             sets = self.filterSets(tracks)
+            # TODO because these are not done in lockstep, we might send tracks multiple times
+            # if the webhook becomes unavailable midway through the loop
             for set in sets:
-                await self.triggerWebhook(artist, set)
+                await self.triggerWebhook(userMap[userId], set)
             await self.insertTracks(userId, tracks)
 
 
 async def main():
     crawler = Crawler()
     await crawler.init()
+    logger.add(LOG_DESTINATION, format="{time} | {level} | {message}", level=LOG_LEVEL)
+    logger.debug(
+        "Starting Crawler with config"
+        + f"{LOG_DESTINATION=},"
+        + f"{LOG_LEVEL=},"
+        + f"{DATA_DIR=},"
+        + f"{SOUNDCLOUD_USERNAME=},"
+        + f"{API_AUTH_METHOD=},"
+        + f"{API_REDIRECT_URI=},"
+        + f"{WEBHOOK=}"
+    )
     try:
         while True:
             start_time = time.time()
@@ -422,7 +454,7 @@ async def main():
                 break
             elapsed_time = time.time() - start_time
             sleep_time = max(0, (60 * 15) - elapsed_time)
-            print(f"Sleeping for ~{int(sleep_time/60)} minutes")
+            logger.info(f"Sleeping until next iteration ({int(sleep_time/60)} minutes)")
             await asyncio.sleep(sleep_time)
     finally:
         await crawler.close()
@@ -430,6 +462,20 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        LOG_LEVEL = os.environ["LOG_LEVEL"].upper().strip()
+        if LOG_LEVEL not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
+            raise ValueError(f"LOG_LEVEL must be one of: {LOG_LEVELS}")
+        LOG_DESTINATION = os.environ["LOG_DESTINATION"].strip()
+        if LOG_DESTINATION.lower() == "stdout":
+            LOG_DESTINATION = sys.stdout
+        elif LOG_DESTINATION.lower() == "stderr":
+            LOG_DESTINATION = sys.stderr
+        else:
+            LOG_DESTINATION = os.path.join(LOG_DESTINATION)
+            if not os.path.exists(os.path.dirname(os.path.realpath(LOG_DESTINATION))):
+                raise ValueError(
+                    "LOG_DESTINATION must be one of: stdout, stderr, or valid path"
+                )
         ONESHOT = os.environ["ONESHOT"].lower().strip() in [
             "true",
             "1",
@@ -445,7 +491,7 @@ if __name__ == "__main__":
         API_REDIRECT_URI = os.environ["API_REDIRECT_URI"]
         WEBHOOK = os.environ["WEBHOOK"]
     except KeyError as e:
-        print(f"Please provide {e} as environment variable")
+        logger.error(f"Please provide {e} as environment variable")
         exit(1)
 
     if not os.path.exists(DATA_DIR):

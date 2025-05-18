@@ -4,6 +4,8 @@ WORKDIR /app
 COPY . .
 RUN pip install -r requirements.txt
 
+ENV LOG_DESTINATION=stdout
+ENV LOG_LEVEL=INFO
 ENV ONESHOT=true
 ENV DATA_DIR=data
 ENV SOUNDCLOUD_USERNAME=soundcloud
