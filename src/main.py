@@ -23,7 +23,6 @@ BASE = "https://api.soundcloud.com"
 AUTH_BASE = "https://secure.soundcloud.com"
 TOKEN_REFRESH_THRESHOLD = 3 * 60
 LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-LOG_DESTINATION = sys.stdout
 
 
 class AuthMethod(Enum):
@@ -77,7 +76,7 @@ class Crawler:
             self.code = None
 
     async def init(self):
-        logger.debug("Initializing Crawler")
+        logger.info("Initializing Crawler")
         await self.readState()
 
         # database
@@ -174,7 +173,10 @@ class Crawler:
                     headers=headers,
                     params=params,
                 ) as resp:
-                    logger.debug(f"GET {url} {headers} {params}")
+                    log_headers = dict(headers)
+                    if "Authorization" in log_headers:
+                        del log_headers["Authorization"]
+                    logger.debug(f"GET {url} {log_headers} {params}")
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 429:
@@ -360,9 +362,9 @@ class Crawler:
             url = res["next_href"]
 
         tracks = list(filter(lambda x: x["created_at"] > until, tracks))
-        logger.info(
-            f"Found {len(tracks)} tracks for {userName} ({userId}) after "
-            + f" {datetime.datetime.fromtimestamp(until).strftime('%Y/%m/%d %H:%M:%S')}"
+        logger.debug(
+            f"Found {len(tracks)} tracks for {userName} after "
+            + f"{datetime.datetime.fromtimestamp(until).strftime('%Y/%m/%d %H:%M:%S')}"
         )
         return userId, tracks
 
@@ -414,12 +416,19 @@ class Crawler:
         )
 
     async def run(self):
+        logger.info(f"Getting user ID for {SOUNDCLOUD_USERNAME}")
         userId = await self.getUserId(SOUNDCLOUD_USERNAME)
+        logger.info(f"Getting followed users for {SOUNDCLOUD_USERNAME}")
         follows = await self.getFollowedUsers(userId)
         userMap = {user["id"]: user for user in follows}
 
+        logger.info(f"Getting new tracks for {len(follows)} followed users")
         tasks = [
-            self.getTracks(user["id"], until=await self.getLatestTimestamp(user["id"]))
+            self.getTracks(
+                user["id"],
+                user["username"],
+                until=await self.getLatestTimestamp(user["id"]),
+            )
             for user in follows
         ]
         for task in asyncio.as_completed(tasks):
@@ -435,24 +444,25 @@ class Crawler:
 async def main():
     crawler = Crawler()
     await crawler.init()
-    logger.add(LOG_DESTINATION, format="{time} | {level} | {message}", level=LOG_LEVEL)
     logger.debug(
-        "Starting Crawler with config"
-        + f"{LOG_DESTINATION=},"
-        + f"{LOG_LEVEL=},"
-        + f"{DATA_DIR=},"
-        + f"{SOUNDCLOUD_USERNAME=},"
-        + f"{API_AUTH_METHOD=},"
-        + f"{API_REDIRECT_URI=},"
+        "Starting Crawler with config "
+        + f"{LOG_DESTINATION=}, "
+        + f"{LOG_LEVEL=}, "
+        + f"{DATA_DIR=}, "
+        + f"{SOUNDCLOUD_USERNAME=}, "
+        + f"{API_AUTH_METHOD=}, "
+        + f"{API_REDIRECT_URI=}, "
         + f"{WEBHOOK=}"
     )
     try:
         while True:
             start_time = time.time()
             await crawler.run()
-            if ONESHOT:
-                break
             elapsed_time = time.time() - start_time
+            logger.info(f"Crawl complete, took {elapsed_time} seconds")
+            if ONESHOT:
+                logger.info("Exiting since this is ONESHOT")
+                break
             sleep_time = max(0, (60 * 15) - elapsed_time)
             logger.info(f"Sleeping until next iteration ({int(sleep_time/60)} minutes)")
             await asyncio.sleep(sleep_time)
@@ -476,6 +486,10 @@ if __name__ == "__main__":
                 raise ValueError(
                     "LOG_DESTINATION must be one of: stdout, stderr, or valid path"
                 )
+        logger.remove()
+        logger.add(
+            LOG_DESTINATION, format="{time} | {level} | {message}", level=LOG_LEVEL
+        )
         ONESHOT = os.environ["ONESHOT"].lower().strip() in [
             "true",
             "1",
@@ -495,6 +509,7 @@ if __name__ == "__main__":
         exit(1)
 
     if not os.path.exists(DATA_DIR):
+        logger.info(f"Creating data directory {DATA_DIR}")
         os.makedirs(DATA_DIR)
 
     asyncio.run(main())
