@@ -345,6 +345,7 @@ class Crawler:
                         track["created_at"], "%Y/%m/%d %H:%M:%S %z"
                     ).timestamp()
                 )
+                track["permalink_url"] = track["permalink_url"].split("?")[0]
                 tracks.append(track)
 
             # tracks are fetched in (chronologically) descending order
